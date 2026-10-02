@@ -105,3 +105,21 @@ class ArrangementIn(BaseModel):
         default_factory=list,
         description="可选地层期位锚点；同一地层不可重复，期位须在 1～总期数内",
     )
+
+
+class ResilienceIn(BaseModel):
+    """证据撤回承受力分析请求（只读，不写库、不递增修订号、不产生变化记录）。
+
+    在 expected_revision 对应的同一正式视图中，求让两个不同已登记地层的确定
+    关系变为未定所需撤回的**最少生效证据数**（只从其余生效证据中选择，
+    protected_evidence 中的受保护证据不可撤回），并列时取证据编号序列字典序
+    最小的一组；原关系未定时撤回数为 0、集合为空。
+    """
+
+    expected_revision: int = Field(ge=0, description="预期的当前正式修订号；过期按 STALE_REVISION 拒绝")
+    stratum_a: str = Field(min_length=1, max_length=128, description="地层编号 A（须与 B 不同且均已登记）")
+    stratum_b: str = Field(min_length=1, max_length=128, description="地层编号 B（须与 A 不同且均已登记）")
+    protected_evidence: List[str] = Field(
+        default_factory=list,
+        description="受保护生效证据编号集合（可为空；自动去重；须为当前生效证据，否则拒绝）",
+    )

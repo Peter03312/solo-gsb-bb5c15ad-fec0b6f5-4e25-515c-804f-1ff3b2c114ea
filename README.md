@@ -46,6 +46,24 @@
   （400 `INVALID_STRATUM`）、锚点地层重复（400 `DUPLICATE_STRATUM`）、锚点期位越界
   （400 `INVALID_PERIOD_POSITION`）、修订号过期（409 `STALE_REVISION`）、推演不存在
   （404 `PROJECTION_NOT_FOUND`）明确拒绝，既有查询与批次语义不变。
+- **证据撤回承受力分析（只读）**：`POST /resilience/retraction-analysis` 输入视图对应的
+  `expected_revision`、两个**不同的已登记**地层 `stratum_a` / `stratum_b` 及可为空的
+  受保护生效证据编号集合 `protected_evidence`（自动去重）。服务在该修订号对应的**同一正式
+  视图**中，只从**其余生效证据**（同一期 / 早于证据均可，受保护证据不可撤回）中求让两层
+  关系变为未定所需的**最少撤回数**，并列时取**证据编号序列字典序最小**的一组，返回原关系、
+  原最优证据路径、建议撤回编号与模拟撤回后的关系：
+  - 关系由“同一期（无向）+ 早于（有向）”混合图上的路径支撑，撤回只删边；使关系变未定 ⇔
+    切断支撑该关系的**全部**路径（最少撤回数即混合证据图上的 s–t 最小割）；
+  - **同一期双向连通按一条证据撤回计数**（无向边割值为 1）；
+  - **替代证据路径仍成立时不判失效**：若受保护证据单独仍支撑某条路径，返回
+    `status=unreachable`、`minimum_retraction_count=null` 与仍成立的（字典序最小）证据路径
+    `remaining_evidence_path`；
+  - 原关系未定时返回 `status=already_undetermined`、撤回数 `0`、空集合；成功找到时
+    `status=retractions_found`，模拟后关系恒为 `undetermined`；
+  - 修订号过期（409 `STALE_REVISION`）、地层未登记（400 `INVALID_STRATUM`）、两层相同
+    （400 `DUPLICATE_STRATUM`）、受保护证据不存在或非生效
+    （400 `INVALID_PROTECTED_EVIDENCE`，`details` 区分 `not_found` / `not_active`）明确拒绝；
+    分析不改断言、修订或变化记录。
 
 ## 快速开始
 
@@ -88,6 +106,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | GET | `/assertions?status=active` | 断言列表 |
 | GET | `/revision-changes?limit=100&cursor=...` | 游标分页追踪各正式修订前后关系/最优路径变化 |
 | GET | `/relationship?a=L1&b=L3` | 查询两地层当前关系及支撑证据路径 |
+| POST | `/resilience/retraction-analysis` | 只读证据撤回承受力分析：求让指定两层关系变为未定的最少生效证据撤回（含受保护证据集合） |
 | GET | `/periodization?expected_revision=1` | 只读分期骨架：同一期等价组 + 组间传递约简后的直接早于边（含孤立地层） |
 | POST | `/periodization/arrangement` | 正式视图只读分期试排：总期数 1～64 + 期位锚点，返回每组在所有可行排布中的最早/最晚期位 |
 | POST | `/projections/{id}/periodization/arrangement` | 推演冻结视图（含已关闭）只读分期试排，返回结构同正式 |
@@ -213,6 +232,90 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
 
 `relation` 取值：`same_period`（同一期）/ `earlier_than`（早于）/ `later_than`（晚于）/ `undetermined`（未定）。
+
+### 证据撤回承受力分析：`POST /resilience/retraction-analysis`（只读）
+
+考古人员核对当前地层关系时，需要知道它对**证据撤回**的承受力：若允许在**同一正式视图**
+中撤回若干生效证据，最少撤回多少条才能让指定两层的确定关系**变为未定**，以及并列时应撤回
+哪一组。请求须携带预期的当前正式修订号 `expected_revision`、两个不同的已登记地层，以及
+可为空的受保护生效证据编号集合 `protected_evidence`（自动去重；这些证据不可撤回）：
+
+```json
+{
+  "expected_revision": 1,
+  "stratum_a": "T1",
+  "stratum_b": "T4",
+  "protected_evidence": []
+}
+```
+
+- **候选范围**：只从“其余生效证据”中选择撤回——同一期证据与早于证据均可入选，
+  `protected_evidence` 中的证据不可撤回；
+- **最少撤回数**：关系由“同一期（无向、可传递）+ 早于（有向）”混合图上的路径支撑，
+  使关系变未定 ⇔ 切断支撑它的**全部**路径。最少撤回数即混合证据图上的 s–t **最小割**；
+  并列时给出**证据编号序列字典序最小**的一组 `suggested_retractions`；
+- **同一期双向连通按一条证据撤回计数**：同一期证据是无向边，割中该证据只计 1 次；
+- **替代证据路径仍成立时不判失效**：若受保护证据单独仍支撑某条路径（受保护子图上关系仍
+  成立），目标无法失效，`status=unreachable`，`minimum_retraction_count` 为 `null`，
+  `remaining_evidence_path` 给出仍成立的（字典序最小）证据路径；
+- **原关系未定时**：`status=already_undetermined`，撤回数 `0`、集合为空；
+- **模拟结果**：成功找到时 `status=retractions_found`，`simulated_relation` 恒为
+  `undetermined`，并附撤回后路径（空）；`original_evidence_path` 为撤回前的最优证据路径，
+  `original_path_detail` / `simulated_path_detail` 逐步展开原始断言；
+- 反向查询（如原关系为 `later_than`）自动规整方向，结果与正向一致。
+
+```json
+{
+  "expected_revision": 1,
+  "current_revision": 1,
+  "revision": 1,
+  "stratum_a": "T1",
+  "stratum_b": "T4",
+  "protected_evidence": [],
+  "original_relation": "earlier_than",
+  "original_relation_label": "早于",
+  "original_evidence_path": ["RV-4"],
+  "original_path_detail": [
+    {"evidence_id": "RV-4", "stratum_a": "T1", "stratum_b": "T4", "relation": "earlier_than", "status": "active"}
+  ],
+  "reachable": true,
+  "status": "retractions_found",
+  "minimum_retraction_count": 2,
+  "suggested_retractions": ["RV-1", "RV-4"],
+  "simulated_relation": "undetermined",
+  "simulated_relation_label": "未定",
+  "simulated_evidence_path": [],
+  "simulated_path_detail": []
+}
+```
+
+上例中 `T1 早于 T4` 同时由直达证据 `RV-4` 与混合链 `RV-1（T1~T2）, RV-2, RV-3` 支撑，
+两条路径互不共边，须各撤一条（共 2 条）；字典序最小的组合是 `[RV-1, RV-4]`。
+受保护使目标不可达时：
+
+```json
+{
+  "reachable": false,
+  "status": "unreachable",
+  "minimum_retraction_count": null,
+  "suggested_retractions": [],
+  "simulated_relation": "earlier_than",
+  "simulated_relation_label": "早于",
+  "remaining_evidence_path": ["RV-4"],
+  "remaining_path_detail": [
+    {"evidence_id": "RV-4", "stratum_a": "T1", "stratum_b": "T4", "relation": "earlier_than", "status": "active"}
+  ]
+}
+```
+
+明确拒绝：修订号过期（409 `STALE_REVISION`，`details.current_revision`）、地层未登记
+（400 `INVALID_STRATUM`）、两层相同（400 `DUPLICATE_STRATUM`）、受保护证据不存在或非生效
+（400 `INVALID_PROTECTED_EVIDENCE`，`details.not_found` / `details.not_active`）。
+分析在 `REPEATABLE READ READ ONLY` 快照事务内完成，**不改断言、修订或变化记录**。
+
+```bash
+bash examples/resilience_demo.sh
+```
 
 ### 分期骨架视图：`GET /periodization`（只读）
 
@@ -423,6 +526,7 @@ bash examples/arrangement_demo.sh
 | 409 | `MERGE_CONFLICT` | 并入核验发现关系冲突（附冲突证据路径），双方不变 |
 | 400 | `INVALID_CURSOR` | 变化追踪分页游标无效 |
 | 400 | `INVALID_PERIOD_POSITION` | 分期试排：锚点期位越界（不在 1～总期数） |
+| 400 | `INVALID_PROTECTED_EVIDENCE` | 撤回承受力分析：受保护证据不存在或非生效（`details` 区分 not_found/not_active） |
 | 400 | `EMPTY_STRATA` | 成果包：地层集合为空 |
 | 400 | `NOT_ENOUGH_STRATA` | 成果包：少于两个地层编号 |
 | 400 | `DUPLICATE_STRATUM` | 成果包：地层编号重复 / 分期试排：锚点地层重复 |
@@ -703,6 +807,13 @@ bash examples/arrangement_demo.sh
 bash examples/preflight_demo.sh
 ```
 
+证据撤回承受力分析演示（最小割最少撤回 / 字典序最小序列 / 同一期按一条计数 /
+替代路径仍成立不可达 / 原关系未定返回零和空集 / 修订、地层、受保护证据无效明确拒绝）：
+
+```bash
+bash examples/resilience_demo.sh
+```
+
 推演（沙盘）端到端演示（创建固定基线、推演批次、关系查询、并入成功与三类并入失败、
 净变更为空只关闭、放弃推演）：
 
@@ -738,6 +849,7 @@ app/
   main.py         # FastAPI 路由与错误处理
   service.py      # 正式批次核验、关系查询、定版快照
   preflight.py    # 提交前只读预检：求消除本批冲突所需撤回的最少生效旧证据（预算 0～3）
+  resilience.py   # 证据撤回承受力（只读）：混合证据图最小割求让两层关系变未定的最少撤回（含受保护集合）
   packages.py     # 专题成果包：定版地层关系封存（冻结、集合幂等、不可变、可转交复核）
   projections.py  # 推演（沙盘）：创建固定基线、推演批次、关系查询、并入核验
   periodization.py # 分期骨架视图（只读）：同一期等价组、组间传递约简直接早于边
@@ -751,6 +863,7 @@ examples/
   periodization_demo.sh # 分期骨架视图示例（等价组/平行合并/传递省略/过期拒绝/撤回重算）
   arrangement_demo.sh # 分期试排示例（最早/最晚界、锚点、三类不可行证据链、推演冻结视图）
   preflight_demo.sh # 提交前只读预检示例（最少撤回/预算不足/新断言自相矛盾/拒绝/只读校验）
+  resilience_demo.sh # 撤回承受力分析示例（最小割/字典序最小/受保护不可达/原关系未定/拒绝）
   projection_demo.sh # 推演端到端示例（沙盘批次、并入成功与三类失败、空净变更）
   changes_demo.sh  # 修订变化追踪示例（变化/路径改变/失败批次/并入/游标分页）
   packages_demo.sh # 专题成果包示例（封存/幂等/不可变/拒绝分支）

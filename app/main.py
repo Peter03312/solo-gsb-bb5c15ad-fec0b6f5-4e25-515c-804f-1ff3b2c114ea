@@ -5,10 +5,10 @@ from typing import Optional
 from fastapi import FastAPI, Query, Request
 from fastapi.responses import JSONResponse
 
-from . import arrangement as arrangement_svc, changes, db, packages as packages_svc, periodization as periodization_svc, preflight as preflight_svc, projections, service
+from . import arrangement as arrangement_svc, changes, db, packages as packages_svc, periodization as periodization_svc, preflight as preflight_svc, projections, resilience, service
 from .derivation import RELATION_LABELS
 from .errors import ApiError
-from .models import ArrangementIn, BatchIn, PackageIn, PreflightIn, ProjectionBatchIn, ProjectionIn, SnapshotIn, StratumIn
+from .models import ArrangementIn, BatchIn, PackageIn, PreflightIn, ProjectionBatchIn, ProjectionIn, ResilienceIn, SnapshotIn, StratumIn
 
 
 @asynccontextmanager
@@ -19,7 +19,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="考古地层关系核验服务",
-    version="1.6.0",
+    version="1.7.0",
     description=(
         "登记遗址地层与带唯一证据编号的“同一期 / 早于”断言；"
         "同一期可传递，早于沿同一期与早于路径推导；"
@@ -29,6 +29,9 @@ app = FastAPI(
         "支持只读分期试排（/periodization/arrangement 与 /projections/{id}/periodization/arrangement）："
         "在总期数（1～64）与地层期位锚点约束下，返回每个同一期等价组在所有可行排布中的最早/最晚期位，"
         "不可行时区分同组锚点矛盾、先后链与锚点不相容、先后链与期数不相容并附证据路径；"
+        "支持只读证据撤回承受力分析（/resilience/retraction-analysis）："
+        "在同一正式视图中求让指定两层关系变为未定所需撤回的最少生效证据"
+        "（受保护证据不可撤回；替代路径仍成立不判失效；同一期双向连通按一条证据计数）；"
         "支持推演（沙盘）：固定基线修订号与断言，推演内独立批次核验，"
         "并入时把相对基线的净变更应用于最新正式状态并重新核验；"
         "支持按正式修订游标分页追踪关系结论及最优支撑路径的变化（/revision-changes）；"
@@ -153,6 +156,26 @@ def list_assertions(status: Optional[str] = Query(default=None, pattern="^(activ
 def get_relationship(a: str = Query(description="地层编号"), b: str = Query(description="地层编号")):
     """查询两地层当前关系：同一期 / 早于 / 晚于 / 未定，附支撑证据路径。"""
     return service.query_relationship(a, b)
+
+
+@app.post("/resilience/retraction-analysis", tags=["query"])
+def post_retraction_analysis(body: ResilienceIn):
+    """证据撤回承受力分析（只读，不写库、不递增修订号、不产生变化记录）。
+
+    在 expected_revision 的同一正式视图中，求让两个不同已登记地层的确定关系
+    变为未定所需撤回的最少生效证据数（受保护证据 protected_evidence 不可撤回，
+    同一期双向连通按一条证据撤回计数），并列取证据编号序列字典序最小的一组，
+    返回原关系、原最优证据路径、建议撤回编号与模拟撤回后的关系。
+
+    - 原关系未定：撤回数 0、建议集合为空（status=already_undetermined）；
+    - 受保护证据单独仍支撑某条路径（替代证据路径仍成立）：status=unreachable，
+      minimum_retraction_count 为 null，附仍成立的证据路径 remaining_evidence_path；
+    - 否则 status=retractions_found，给出最少撤回集合，模拟后关系恒为未定。
+    - 修订号过期 409 STALE_REVISION、地层未登记 400 INVALID_STRATUM、
+      两层相同 400 DUPLICATE_STRATUM、受保护证据不存在或非生效
+      400 INVALID_PROTECTED_EVIDENCE。
+    """
+    return resilience.analyze_retraction_resilience(body)
 
 
 @app.get("/periodization", tags=["query"])
