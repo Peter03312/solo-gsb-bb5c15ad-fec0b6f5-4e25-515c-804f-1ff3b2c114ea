@@ -10,6 +10,13 @@
 
 路径选取：证据数最少者优先；并列时按证据编号序列字典序最小者。
 
+证据撤回承受力（withdrawal_analysis）：在“同一期 + 早于”混合图上求使两地层
+关系变为未定所需撤回的最少**生效证据**数。同一期证据是无向边（撤回一条即双向
+连通同时断开，按一条证据计数，容量网络中用一对容量 1 的反向弧表示）；早于证据
+是容量 1 的有向边；受保护证据容量为无穷大。s-t 最小割即最少撤回数（割值按
+证据计数），最小割 ≥ 无穷大当且仅当存在一条完全由受保护证据构成的 s-t 路径
+（目标不可失效）。最小割集合并列时按排序后的证据编号序列取字典序最小者。
+
 分期试排（trial_arrangement）：在同一期等价组商图（DAG）上求每组在
 “同组同期、早于严格递增、锚点期位固定、总期数 1～64”约束下，于**全部**
 可行排布中可取的最早 / 最晚期位（ASAP/ALAP 界），或分类给出不可行原因。
@@ -785,4 +792,214 @@ def trial_arrangement(
             )
             for i in range(n)
         ),
+    )
+
+
+# ------------------------------------------------------------------ 证据撤回承受力
+@dataclass(frozen=True)
+class WithdrawalAnalysis:
+    """两地层关系对证据撤回的承受力（纯函数结果，结构合法性由服务层保证）。
+
+    - determined=False：原关系本就未定，无需撤回（minimum=0，建议为空）；
+    - determined=True、reachable=False：受保护证据保证至少一条 s-t 路径始终成立，
+      目标不可失效；surviving_relation/path 为“仅保留受保护证据”视图下仍成立的
+      结论与其最优证据路径（该路径只含受保护证据，撤回其余任何生效证据都不影响它）；
+    - determined=True、reachable=True：minimum 为最少撤回证据数，
+      suggested_retractions 为撤回数并列时证据编号序列字典序最小的一组；
+      撤回该组后关系为未定，simulated_path 恒为空。
+    """
+
+    original_relation: str
+    original_path: Optional[Tuple[str, ...]]
+    determined: bool
+    reachable: bool
+    minimum: int
+    suggested_retractions: Tuple[str, ...]
+    simulated_relation: str
+    simulated_path: Optional[Tuple[str, ...]]
+
+
+class _Dinic:
+    """整数容量网络上的 Dinic 最大流（纯 Python）。
+
+    无向边按两条互相独立的容量 c 有向弧加入：残余网络中每条弧各自带反向残量弧，
+    与“另一方向的独立容量弧”互不干扰。任一 s∈S、t∉S 的有向割中，无向边要么
+    S→外一条弧过割、要么外→S 一条弧过割（两条不会同时过割），故割值恰为 c——
+    与无向边在无向割中按一条边计数一致。
+    """
+
+    def __init__(self, n: int) -> None:
+        self.n = n
+        self.graph: List[List[List[int]]] = [[] for _ in range(n)]  # 每弧 [to, rev, cap]
+
+    def add_arc(self, u: int, v: int, cap: int) -> None:
+        self.graph[u].append([v, len(self.graph[v]), cap])
+        self.graph[v].append([u, len(self.graph[u]) - 1, 0])
+
+    def add_undirected(self, u: int, v: int, cap: int) -> None:
+        # 两条独立的容量 cap 有向弧（各自携带自己的零残量反向弧）
+        self.add_arc(u, v, cap)
+        self.add_arc(v, u, cap)
+
+    def max_flow(self, s: int, t: int, limit: Optional[int] = None) -> int:
+        flow = 0
+        n = self.n
+        while True:
+            level = [-1] * n
+            level[s] = 0
+            queue = deque([s])
+            while queue:
+                u = queue.popleft()
+                for e in self.graph[u]:
+                    if e[2] > 0 and level[e[0]] < 0:
+                        level[e[0]] = level[u] + 1
+                        queue.append(e[0])
+            if level[t] < 0:
+                return flow
+            it = [0] * n
+
+            def dfs(u: int, pushed: int) -> int:
+                if u == t:
+                    return pushed
+                while it[u] < len(self.graph[u]):
+                    e = self.graph[u][it[u]]
+                    if e[2] > 0 and level[e[0]] == level[u] + 1:
+                        d = dfs(e[0], pushed if pushed < e[2] else e[2])
+                        if d:
+                            e[2] -= d
+                            self.graph[e[0]][e[1]][2] += d
+                            return d
+                    it[u] += 1
+                return 0
+
+            while True:
+                if limit is not None and flow >= limit:
+                    return flow
+                pushed = dfs(s, limit - flow if limit is not None else 10**18)
+                if not pushed:
+                    break
+                flow += pushed
+
+
+def _mixed_flow_network(
+    assertions: Sequence[Assertion],
+    protected: frozenset,
+    removed: frozenset,
+    index: Dict[str, int],
+    inf: int,
+) -> _Dinic:
+    """构建“同一期（无向容量边）+ 早于（有向容量边）”容量网络。
+
+    受保护证据容量为 inf；已强制撤回（removed）的证据容量为 0（不加入）；
+    其余生效证据容量为 1。
+    """
+    dinic = _Dinic(len(index))
+    for ar in assertions:
+        if ar.evidence_id in removed:
+            continue
+        if ar.a not in index or ar.b not in index:
+            continue
+        u, v = index[ar.a], index[ar.b]
+        cap = inf if ar.evidence_id in protected else 1
+        if u == v:
+            continue  # 自环不参与 s-t 割（防御性；正式核验亦不允许自反早于）
+        if ar.relation == SAME:
+            dinic.add_undirected(u, v, cap)
+        else:  # EARLIER：a -> b 有向
+            dinic.add_arc(u, v, cap)
+    return dinic
+
+
+def withdrawal_analysis(
+    assertions: Sequence[Assertion],
+    x: str,
+    y: str,
+    protected: FrozenSet[str] = frozenset(),
+) -> WithdrawalAnalysis:
+    """求使 x、y 关系变为未定所需撤回的最少生效证据（受保护证据不可撤回）。
+
+    返回原关系与原最优证据路径、可达性（目标能否失效）、最少撤回数与字典序最小
+    的证据编号序列，以及模拟撤回后的关系与（仍成立时的）证据路径。分析不修改
+    断言集。入参的结构合法性（地层存在、受保护证据均为生效证据）由服务层保证。
+    """
+    protected = frozenset(protected)
+    derivation = Derivation(assertions)
+    original_relation, original_path = derivation.relation(x, y)
+
+    if original_relation == "undetermined":
+        return WithdrawalAnalysis(
+            original_relation=original_relation,
+            original_path=None,
+            determined=False,
+            reachable=True,
+            minimum=0,
+            suggested_retractions=(),
+            simulated_relation="undetermined",
+            simulated_path=None,
+        )
+
+    # 关系方向 -> 需切断的路径方向（同一期 / 早于：x→y；晚于：y→x）
+    src, dst = (x, y) if original_relation in ("same_period", "earlier_than") else (y, x)
+
+    # 网络节点只需包含断言涉及的地层；x、y 一定在其中（原关系确定）
+    nodes: Set[str] = {src, dst}
+    for ar in assertions:
+        nodes.add(ar.a)
+        nodes.add(ar.b)
+    index = {s: i for i, s in enumerate(sorted(nodes))}
+    s, t = index[src], index[dst]
+
+    cuttable = [a for a in assertions if a.evidence_id not in protected]
+    inf = len(cuttable) + 1  # 大于任何只由容量 1 边构成的割
+
+    def mincut(removed: frozenset) -> int:
+        return _mixed_flow_network(assertions, protected, removed, index, inf).max_flow(s, t)
+
+    k = mincut(frozenset())
+    original_path_tuple = tuple(original_path or ())
+
+    if k >= inf:
+        # 存在完全由受保护证据构成的 s-t 路径：撤回其余任何生效证据都无法使其未定。
+        # “仅保留受保护证据”视图下的结论与最优路径即撤回模拟后仍成立的路径。
+        kept = [a for a in assertions if a.evidence_id in protected]
+        surviving_relation, surviving_path = Derivation(kept).relation(x, y)
+        return WithdrawalAnalysis(
+            original_relation=original_relation,
+            original_path=original_path_tuple,
+            determined=True,
+            reachable=False,
+            minimum=k,  # ≥ inf：受保护路径上每条边容量均为 inf
+            suggested_retractions=(),
+            simulated_relation=surviving_relation,
+            simulated_path=tuple(surviving_path or ()),
+        )
+
+    # 贪心构造同规模（k）割中“排序后证据编号序列字典序最小”的一组：
+    # 按编号升序逐个尝试强制撤回 e；若撤回后最小割恰再降 1（剩余图仍存在规模
+    # k-|F|-1 的割可与之拼成 k 割），则 e 属于某个最小割且编号最小，必选；
+    # 否则 e 不入选。强制容量归零不改变“割按证据计数”的口径。
+    forced: Set[str] = set()
+    for ar in sorted(assertions, key=lambda a: a.evidence_id):
+        eid = ar.evidence_id
+        if eid in protected or eid in forced:
+            continue
+        if len(forced) == k:
+            break
+        trial = frozenset(forced | {eid})
+        if mincut(trial) == k - len(trial):
+            forced.add(eid)
+
+    # 终局核验：撤回建议集合后 s、t 在混合图上必须不再连通（关系变为未定）。
+    residual = [a for a in assertions if a.evidence_id not in forced]
+    simulated_relation, simulated_path = Derivation(residual).relation(x, y)
+    assert simulated_relation == "undetermined", (simulated_relation, sorted(forced))
+    return WithdrawalAnalysis(
+        original_relation=original_relation,
+        original_path=original_path_tuple,
+        determined=True,
+        reachable=True,
+        minimum=k,
+        suggested_retractions=tuple(sorted(forced)),
+        simulated_relation="undetermined",
+        simulated_path=None,
     )

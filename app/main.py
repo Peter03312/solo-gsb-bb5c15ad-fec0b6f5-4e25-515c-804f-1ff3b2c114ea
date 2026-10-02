@@ -5,10 +5,10 @@ from typing import Optional
 from fastapi import FastAPI, Query, Request
 from fastapi.responses import JSONResponse
 
-from . import arrangement as arrangement_svc, changes, db, packages as packages_svc, periodization as periodization_svc, preflight as preflight_svc, projections, service
+from . import arrangement as arrangement_svc, changes, db, packages as packages_svc, periodization as periodization_svc, preflight as preflight_svc, projections, service, withdrawal as withdrawal_svc
 from .derivation import RELATION_LABELS
 from .errors import ApiError
-from .models import ArrangementIn, BatchIn, PackageIn, PreflightIn, ProjectionBatchIn, ProjectionIn, SnapshotIn, StratumIn
+from .models import ArrangementIn, BatchIn, PackageIn, PreflightIn, ProjectionBatchIn, ProjectionIn, SnapshotIn, StratumIn, WithdrawalAnalysisIn
 
 
 @asynccontextmanager
@@ -19,7 +19,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="考古地层关系核验服务",
-    version="1.6.0",
+    version="1.7.0",
     description=(
         "登记遗址地层与带唯一证据编号的“同一期 / 早于”断言；"
         "同一期可传递，早于沿同一期与早于路径推导；"
@@ -29,6 +29,9 @@ app = FastAPI(
         "支持只读分期试排（/periodization/arrangement 与 /projections/{id}/periodization/arrangement）："
         "在总期数（1～64）与地层期位锚点约束下，返回每个同一期等价组在所有可行排布中的最早/最晚期位，"
         "不可行时区分同组锚点矛盾、先后链与锚点不相容、先后链与期数不相容并附证据路径；"
+        "支持只读证据撤回承受力分析（/relationship/withdrawal-analysis）：求使两层关系变为未定"
+        "所需撤回的最少生效证据（同一期双向按一条计数，替代路径仍成立不判失效），"
+        "并列取证据编号序列字典序最小方案；受保护证据使目标不可失效时返回不可达及仍成立路径；"
         "支持推演（沙盘）：固定基线修订号与断言，推演内独立批次核验，"
         "并入时把相对基线的净变更应用于最新正式状态并重新核验；"
         "支持按正式修订游标分页追踪关系结论及最优支撑路径的变化（/revision-changes）；"
@@ -190,6 +193,25 @@ def post_periodization_arrangement(body: ArrangementIn):
     - 修订号过期 409 STALE_REVISION（details.current_revision），全程只读快照。
     """
     return arrangement_svc.arrange_formal(body)
+
+
+@app.post("/relationship/withdrawal-analysis", tags=["query"])
+def post_relationship_withdrawal_analysis(body: WithdrawalAnalysisIn):
+    """当前正式修订视图下的证据撤回承受力分析（只读，不写库、不递增修订号）。
+
+    - 同一期证据按无向边计一条（撤回即双向断开），早于证据按有向边计一条；
+    - 求使两地层关系变为未定所需撤回的最少生效证据（替代路径仍成立则不算失效），
+      并列时取证据编号序列字典序最小的一组；
+    - 返回原关系、原最优证据路径、建议撤回编号与模拟撤回后的关系；
+    - 原关系未定：`status=already_undetermined`，零撤回、空集合；
+    - 受保护证据使目标无法失效：`status=protected_unreachable`，
+      `reachable=false`、`retraction_count=null`，并给出仅保留受保护证据后
+      仍成立的关系与证据路径（`simulated_*` / `surviving_evidence_path`）；
+    - 修订号过期 409 STALE_REVISION、地层未登记 400 INVALID_STRATUM、
+      两层相同 400 DUPLICATE_STRATUM、受保护证据不存在或已撤回
+      400 INVALID_PROTECTED_EVIDENCE。
+    """
+    return withdrawal_svc.analyze(body)
 
 
 # ------------------------------------------------------------------ 修订变化追踪

@@ -33,6 +33,18 @@
   修订号对应的同一正式视图中先按原批次语义处理新增与撤回，再寻找**不包含本批新增证据、也不
   重复本批撤回**的额外撤回集合：撤回数最少、并列时按证据编号序列字典序最小，返回该集合与
   应用后是否通过关系核验。预检**不生成修订、变化记录或断言**，正式批次请求与返回格式不变。
+- **证据撤回承受力（只读）**：`POST /relationship/withdrawal-analysis` 输入预期正式修订号、
+  **两个不同**的已登记地层与可为空的受保护生效证据编号集合 `protected_evidence`。在该修订号
+  对应的同一正式视图中，求使两层关系变为未定所需撤回的**最少生效证据数**——撤回只能从
+  其余生效证据中选择；并列时返回证据编号序列字典序最小的一组。**同一期证据是无向边，
+  撤回一条即双向连通同时断开，按一条证据计数**；**替代证据路径仍成立时不判失效**（最小割按
+  证据计数，割尽全部“同一期 + 早于”混合推导路径才会未定）。响应返回原关系、原最优证据路径、
+  建议撤回编号与模拟撤回后的关系；**原关系未定时返回零与空集合**；**受保护证据使目标无法
+  失效时明确返回不可达**（`reachable=false`）及仅保留受保护证据后仍成立的关系与证据路径。
+  分析在 `REPEATABLE READ READ ONLY` 快照事务内完成，不写库、不递增修订号、不改断言或变化
+  记录；修订号过期（409 `STALE_REVISION`）、地层无效（400 `INVALID_STRATUM`）、两层相同
+  （400 `DUPLICATE_STRATUM`）、受保护证据不存在或已撤回（400 `INVALID_PROTECTED_EVIDENCE`）
+  明确拒绝。
 - **分期试排（只读）**：`POST /periodization/arrangement`（正式）与
   `POST /projections/{id}/periodization/arrangement`（推演冻结视图，含已关闭推演）输入
   视图对应的 `expected_revision`、总期数 `total_periods`（1～64）及可选地层期位锚点
@@ -88,6 +100,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | GET | `/assertions?status=active` | 断言列表 |
 | GET | `/revision-changes?limit=100&cursor=...` | 游标分页追踪各正式修订前后关系/最优路径变化 |
 | GET | `/relationship?a=L1&b=L3` | 查询两地层当前关系及支撑证据路径 |
+| POST | `/relationship/withdrawal-analysis` | 只读证据撤回承受力：求使两层关系变为未定的最少撤回证据（并列取字典序最小），支持受保护证据 |
 | GET | `/periodization?expected_revision=1` | 只读分期骨架：同一期等价组 + 组间传递约简后的直接早于边（含孤立地层） |
 | POST | `/periodization/arrangement` | 正式视图只读分期试排：总期数 1～64 + 期位锚点，返回每组在所有可行排布中的最早/最晚期位 |
 | POST | `/projections/{id}/periodization/arrangement` | 推演冻结视图（含已关闭）只读分期试排，返回结构同正式 |
@@ -213,6 +226,118 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
 
 `relation` 取值：`same_period`（同一期）/ `earlier_than`（早于）/ `later_than`（晚于）/ `undetermined`（未定）。
+
+### 证据撤回承受力：`POST /relationship/withdrawal-analysis`（只读）
+
+考古人员核对当前地层关系时，需要知道它对**证据撤回**的承受力：给定预期正式修订号、两个
+已登记地层与可为空的受保护生效证据集合，服务在**同一只读快照视图**内把生效断言建模为
+
+- 节点：已登记地层；
+- **同一期证据 → 无向边**：撤回一条即双向连通同时断开，按**一条**证据计数；
+- **早于证据 → `stratum_a → stratum_b` 的有向边**，撤回一条按一条计数；
+
+并在该“同一期 + 早于”混合容量网络上求两地层间的 **s-t 最小割**（每条可撤回证据容量 1，
+受保护证据容量为无穷大）。最小割值即让两层关系变为**未定**所需撤回的**最少生效证据数**：
+只要还有一条推导路径（替代证据路径）成立，关系就不会判失效。并列（同为最小割）时按
+**排序后的证据编号序列字典序最小**返回一组。
+
+- **请求体**：
+
+  | 字段 | 说明 |
+  | --- | --- |
+  | `expected_revision`（≥0） | 预期的当前正式修订号；过期返回 409 `STALE_REVISION`（`details.current_revision`） |
+  | `stratum_a` / `stratum_b` | 两个**不同**的已登记地层；未登记 400 `INVALID_STRATUM`，相同 400 `DUPLICATE_STRATUM` |
+  | `protected_evidence`（可空） | 受保护、不可撤回的**生效**证据编号数组；缺省 / `null` / `[]` 均视为空集合（自动去重排序）；编号不存在或已撤回返回 400 `INVALID_PROTECTED_EVIDENCE`（`details.evidence_not_found` / `evidence_not_active`） |
+
+- **成功响应**（HTTP 恒 200；结构性拒绝为 4xx/409），公共字段：
+  `scope="formal"`、`expected_revision`/`current_revision`/`revision`（恒相同）、
+  `protected_evidence`（排序去重回显）、`original_relation`(+label)、`original_evidence_path`
+  与 `original_path_detail`（原最优证据路径及逐步原始断言，结构同关系查询）、
+  `simulated_relation`(+label)、`simulated_evidence_path`、`simulated_path_detail`
+  （模拟撤回后的关系与仍成立路径）、`reachable`、`status`、`message`。
+
+  | `status` | 情形 | `reachable` | `retraction_count` | `suggested_retractions` |
+  | --- | --- | --- | --- | --- |
+  | `already_undetermined` | 原关系已为未定 | `true` | `0` | `[]`（原最优路径为 `null`） |
+  | `retractions_found` | 可在撤回最少证据后变为未定；模拟关系恒为 `undetermined`、模拟路径为 `null` | `true` | 最少撤回数 | 排序后的字典序最小证据序列 |
+  | `protected_unreachable` | 受保护证据保证至少一条推导路径始终成立，撤回其余任何生效证据都无法使其未定 | `false` | `null` | `[]`；另给 `surviving_evidence_path`/`surviving_path_detail`（= 仅保留受保护证据后仍成立的路径，路径上只含受保护证据） |
+
+  > 关系方向按原查询口径处理：`earlier_than` 切断 `a→b` 全部混合路径，`later_than`
+  > 切断 `b→a`，`same_period` 切断同一期无向连通。同一期双向连通按**一条**证据撤回计数。
+
+```bash
+curl -s -X POST "$BASE/relationship/withdrawal-analysis" \
+  -H 'Content-Type: application/json' -d '{
+    "expected_revision": 1,
+    "stratum_a": "L1",
+    "stratum_b": "L3",
+    "protected_evidence": []
+  }'
+```
+
+存在两条边不相交推导路径（L1→L3 直达 EV-030；L1~L2 同一期 EV-001 + L2<L3 EV-002）时，
+撤回任一条都仍有替代路径，最少需撤回 2 条：
+
+```json
+{
+  "scope": "formal",
+  "expected_revision": 1,
+  "current_revision": 1,
+  "revision": 1,
+  "stratum_a": "L1",
+  "stratum_b": "L3",
+  "protected_evidence": [],
+  "protected_evidence_count": 0,
+  "original_relation": "earlier_than",
+  "original_relation_label": "早于",
+  "original_evidence_path": ["EV-030"],
+  "original_path_detail": [
+    {"evidence_id": "EV-030", "stratum_a": "L1", "stratum_b": "L3", "relation": "earlier_than", "status": "active"}
+  ],
+  "reachable": true,
+  "simulated_relation": "undetermined",
+  "simulated_relation_label": "未定",
+  "simulated_evidence_path": null,
+  "simulated_path_detail": [],
+  "suggested_retractions": ["EV-001", "EV-030"],
+  "retraction_count": 2,
+  "status": "retractions_found",
+  "message": "撤回 2 条生效证据（字典序最小方案）后，L1 与 L3 的关系变为未定"
+}
+```
+
+受保护证据使目标不可失效时（EV-030 独自构成 L1→L3 的完整路径）：
+
+```json
+{
+  "reachable": false,
+  "status": "protected_unreachable",
+  "retraction_count": null,
+  "suggested_retractions": [],
+  "original_relation": "earlier_than",
+  "original_evidence_path": ["EV-030"],
+  "simulated_relation": "earlier_than",
+  "simulated_relation_label": "早于",
+  "simulated_evidence_path": ["EV-030"],
+  "simulated_path_detail": [
+    {"evidence_id": "EV-030", "stratum_a": "L1", "stratum_b": "L3", "relation": "earlier_than", "status": "active"}
+  ],
+  "surviving_evidence_path": ["EV-030"],
+  "surviving_path_detail": [
+    {"evidence_id": "EV-030", "stratum_a": "L1", "stratum_b": "L3", "relation": "earlier_than", "status": "active"}
+  ],
+  "message": "目标不可达：受保护生效证据保证至少一条证据路径始终成立，撤回其余任何生效证据都无法使该关系变为未定；simulated_* 为仅保留受保护证据后仍成立的关系与证据路径"
+}
+```
+
+分析**只读**（`REPEATABLE READ READ ONLY` 快照事务）：不写库、不递增修订号，断言、修订
+审计与变化记录均不变；批次、查询、定版、推演、预检等既有接口语义不变。完整端到端示例
+（双路径最小割、单链瓶颈、反向晚于、原关系未定、受保护不可达与仍成立路径、各类明确拒绝、
+只读校验）：
+
+```bash
+bash examples/withdrawal_demo.sh
+```
 
 ### 分期骨架视图：`GET /periodization`（只读）
 
@@ -425,7 +550,8 @@ bash examples/arrangement_demo.sh
 | 400 | `INVALID_PERIOD_POSITION` | 分期试排：锚点期位越界（不在 1～总期数） |
 | 400 | `EMPTY_STRATA` | 成果包：地层集合为空 |
 | 400 | `NOT_ENOUGH_STRATA` | 成果包：少于两个地层编号 |
-| 400 | `DUPLICATE_STRATUM` | 成果包：地层编号重复 / 分期试排：锚点地层重复 |
+| 400 | `DUPLICATE_STRATUM` | 成果包：地层编号重复 / 分期试排：锚点地层重复 / 撤回承受力：两个地层相同 |
+| 400 | `INVALID_PROTECTED_EVIDENCE` | 撤回承受力：受保护证据编号不存在或非生效（`details.evidence_not_found` / `evidence_not_active`） |
 | 404 | `PACKAGE_NOT_FOUND` | 成果包不存在 |
 
 ## 正式修订关系变化追踪
@@ -703,6 +829,13 @@ bash examples/arrangement_demo.sh
 bash examples/preflight_demo.sh
 ```
 
+证据撤回承受力演示（双路径最小割 / 单链瓶颈 / 反向晚于 / 原关系未定 /
+受保护证据不可达与仍成立路径 / 过期修订号、无效地层、无效受保护证据明确拒绝 / 全程只读）：
+
+```bash
+bash examples/withdrawal_demo.sh
+```
+
 推演（沙盘）端到端演示（创建固定基线、推演批次、关系查询、并入成功与三类并入失败、
 净变更为空只关闭、放弃推演）：
 
@@ -742,8 +875,9 @@ app/
   projections.py  # 推演（沙盘）：创建固定基线、推演批次、关系查询、并入核验
   periodization.py # 分期骨架视图（只读）：同一期等价组、组间传递约简直接早于边
   arrangement.py   # 分期试排（只读）：总期数+锚点约束下每组在所有可行排布中的最早/最晚期位
+  withdrawal.py    # 证据撤回承受力（只读）：使两层关系变为未定的最少撤回证据（最小割）、受保护不可达
   changes.py      # 正式修订变化追踪：前后差异计算、游标分页、启动历史回填
-  derivation.py   # 推导引擎：并查集等价类、DAG 校验、最优证据路径、分期骨架、分期试排
+  derivation.py   # 推导引擎：并查集等价类、DAG 校验、最优证据路径、分期骨架、分期试排、撤回承受力最小割
   db.py           # 连接池与模式初始化（启动时自动建表、幂等回填）
   models.py       # 请求模型
 examples/

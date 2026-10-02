@@ -105,3 +105,21 @@ class ArrangementIn(BaseModel):
         default_factory=list,
         description="可选地层期位锚点；同一地层不可重复，期位须在 1～总期数内",
     )
+
+
+class WithdrawalAnalysisIn(BaseModel):
+    """证据撤回承受力分析请求（只读，不写库、不递增修订号、不改变断言）。
+
+    在 expected_revision 对应的同一正式视图内，对两个**不同**的已登记地层，
+    求使二者关系变为未定所需撤回的最少生效证据；只能从“除受保护证据外仍生效”
+    的证据中选择撤回。原关系未定时无需撤回（0 与空集合）；受保护证据保证某条
+    路径始终成立时明确返回目标不可达及仍成立的证据路径。
+    """
+
+    expected_revision: int = Field(ge=0, description="预期的当前正式修订号；过期返回 409 STALE_REVISION")
+    stratum_a: str = Field(min_length=1, max_length=128, description="地层编号 A（须已登记）")
+    stratum_b: str = Field(min_length=1, max_length=128, description="地层编号 B（须与 A 不同且已登记）")
+    protected_evidence: Optional[List[Annotated[str, Field(min_length=1, max_length=128)]]] = Field(
+        default=None,
+        description="受保护、不可撤回的生效证据编号集合；可空 / 缺省视为空集合，编号须为当前生效证据",
+    )
